@@ -229,13 +229,14 @@ app.get('/api/dm_messages', async (req, res) => {
 });
 
 // ---------- ADMIN OPERATIONS (service-role required) ----------
+const ADMIN_SECRET = process.env.ADMIN_SECRET || 'ayam-admin';
 function adminAuth(req, res) {
   const token = (req.headers.authorization || '').replace(/^Bearer\s+/i, '').trim();
-  if (!SUPABASE_SERVICE_ROLE_KEY || token !== SUPABASE_SERVICE_ROLE_KEY) {
-    res.status(403).json({ error: 'Forbidden: invalid admin key' });
-    return false;
-  }
-  return true;
+  if (!token) { res.status(403).json({ error: 'Forbidden: no token' }); return false; }
+  // Accept either the service role key OR the admin secret
+  if (token === SUPABASE_SERVICE_ROLE_KEY || token === ADMIN_SECRET) return true;
+  res.status(403).json({ error: 'Forbidden: invalid admin key' });
+  return false;
 }
 
 app.post('/api/admin/delete-agency', async (req, res) => {
