@@ -325,6 +325,43 @@ app.post('/api/admin/topup-direct', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+app.post('/api/admin/open-agency', async (req, res) => {
+  try {
+    if (!adminAuth(req, res)) return;
+    const { numeric_id, agency_type, agency_name } = req.body;
+    if (!numeric_id) return res.status(400).json({ error: 'numeric_id required' });
+
+    // 1. Call RPC to create agency + wallet + DM
+    const { data: rpcResult, error: rpcErr } = await supabase.rpc('rpc_open_agency_for_user', {
+      p_target_numeric_id: numeric_id,
+      p_agency_type: agency_type || 'shipping',
+      p_agency_name: agency_name || '',
+    });
+    if (rpcErr) throw rpcErr;
+    if (!rpcResult?.ok) return res.status(400).json({ error: rpcResult?.error || 'فشل فتح الوكالة' });
+
+    const email = `${numeric_id}@ayam.chat`;
+    const password = `ayam${numeric_id}`;
+
+    // 2. Create Supabase auth account
+    try {
+      const { error: authErr } = await supabase.auth.admin.createUser({
+        email,
+        password,
+        email_confirm: true,
+        user_metadata: { numeric_id, agency_id: rpcResult.agency_id },
+      });
+      if (authErr && !authErr.message?.includes('already')) {
+        console.warn('Auth account creation warning:', authErr.message);
+      }
+    } catch (e) {
+      console.warn('Auth account creation failed:', e);
+    }
+
+    res.json({ ok: true, agency_id: rpcResult.agency_id, dashboard_email: email, dashboard_password: password });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // ---------- DASHBOARD STATS ----------
 app.get('/api/dashboard/stats', async (req, res) => {
   try {
