@@ -440,5 +440,300 @@ module.exports = function createAgencyRoutes(supabase, authMiddleware) {
     } catch (e) { res.status(500).json({ error: e.message }); }
   });
 
+  // ─── PAYMENT GATEWAYS ───────────────────────────────
+
+  // GET /api/agency/payment-gateways — list active gateways
+  router.get('/payment-gateways', async (req, res) => {
+    try {
+      const { data, error } = await supabase
+        .from('payment_gateways')
+        .select('*')
+        .eq('is_active', true)
+        .order('sort_order');
+      if (error) throw error;
+      res.json(data || []);
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  // GET /api/agency/payment-gateways/all — admin: list all gateways
+  router.get('/payment-gateways/all', async (req, res) => {
+    try {
+      const { data, error } = await supabase
+        .from('payment_gateways')
+        .select('*')
+        .order('sort_order');
+      if (error) throw error;
+      res.json(data || []);
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  // ─── TOP-UP REQUESTS ───────────────────────────────
+
+  // POST /api/agency/topup-request — user submits a top-up request
+  router.post('/topup-request', async (req, res) => {
+    try {
+      const { agency_id, gateway_id, amount_usd, diamonds, sender_number, transaction_ref } = req.body;
+      if (!agency_id || !gateway_id || !amount_usd || !diamonds) {
+        return res.status(400).json({ error: 'Missing required fields' });
+      }
+      if (amount_usd <= 0 || diamonds <= 0) {
+        return res.status(400).json({ error: 'Amount must be > 0' });
+      }
+
+      const { data, error } = await supabase
+        .from('agency_topup_requests')
+        .insert({
+          agency_id,
+          owner_uid: req.user.sub,
+          gateway_id,
+          amount_usd,
+          diamonds,
+          sender_number: sender_number || '',
+          transaction_ref: transaction_ref || '',
+        })
+        .select('*')
+        .single();
+      if (error) throw error;
+      res.json(data);
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  // GET /api/agency/topup-requests — list requests
+  router.get('/topup-requests', async (req, res) => {
+    try {
+      const { status, agency_id } = req.query;
+      let query = supabase.from('agency_topup_requests').select('*').order('created_at', { ascending: false });
+      if (status) query = query.eq('status', status);
+      if (agency_id) query = query.eq('agency_id', agency_id);
+      const { data, error } = await query;
+      if (error) throw error;
+      res.json(data || []);
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  // POST /api/agency/topup-approve — admin approves a request
+  router.post('/topup-approve', async (req, res) => {
+    try {
+      const { request_id } = req.body;
+      if (!request_id) return res.status(400).json({ error: 'request_id required' });
+      const { data, error } = await supabase.rpc('rpc_approve_topup', {
+        p_request_id: request_id,
+        p_admin_id: req.user.sub,
+      });
+      if (error) throw error;
+      res.json(data);
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  // POST /api/agency/topup-reject — admin rejects a request
+  router.post('/topup-reject', async (req, res) => {
+    try {
+      const { request_id, reason } = req.body;
+      if (!request_id) return res.status(400).json({ error: 'request_id required' });
+      const { data, error } = await supabase.rpc('rpc_reject_topup', {
+        p_request_id: request_id,
+        p_admin_id: req.user.sub,
+        p_reason: reason || '',
+      });
+      if (error) throw error;
+      res.json(data);
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  // POST /api/agency/admin-topup — admin directly top-ups agency (no request)
+  router.post('/admin-topup', async (req, res) => {
+    try {
+      const { agency_id, diamonds } = req.body;
+      if (!agency_id || !diamonds || diamonds <= 0) {
+        return res.status(400).json({ error: 'agency_id and diamonds > 0 required' });
+      }
+      const { data, error } = await supabase.rpc('rpc_admin_topup_agency', {
+        p_agency_id: agency_id,
+        p_diamonds: diamonds,
+        p_admin_id: req.user.sub,
+      });
+      if (error) throw error;
+      res.json(data);
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  // GET /api/agency/topup-logs — top-up history
+  router.get('/topup-logs', async (req, res) => {
+    try {
+      const { agency_id } = req.query;
+      let query = supabase.from('agency_topup_logs').select('*').order('created_at', { ascending: false }).limit(100);
+      if (agency_id) query = query.eq('agency_id', agency_id);
+      const { data, error } = await query;
+      if (error) throw error;
+      res.json(data || []);
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  // ─── AGENCY PROFILE ───────────────────────────────
+
+  // GET /api/agency/profile?agency_id=XXXX
+  router.get('/profile', async (req, res) => {
+    try {
+      const { agency_id } = req.query;
+      if (!agency_id) return res.status(400).json({ error: 'agency_id required' });
+      const { data, error } = await supabase.from('agencies').select('*').eq('id', agency_id).maybeSingle();
+      if (error) throw error;
+      if (!data) return res.status(404).json({ error: 'Agency not found' });
+      res.json(data);
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  // PUT /api/agency/profile — update name + photo
+  router.put('/profile', async (req, res) => {
+    try {
+      const { agency_id, name, photo_url } = req.body;
+      if (!agency_id) return res.status(400).json({ error: 'agency_id required' });
+
+      const updates = {};
+      if (name !== undefined) updates.name = name;
+      if (photo_url !== undefined) updates.photo_url = photo_url;
+      updates.updated_at = new Date().toISOString();
+
+      const { data, error } = await supabase
+        .from('agencies')
+        .update(updates)
+        .eq('id', agency_id)
+        .select('*')
+        .single();
+      if (error) throw error;
+      res.json(data);
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  // ─── INVITE MEMBER ───────────────────────────────
+
+  // POST /api/agency/invite-member — send invitation to a user by numeric_id
+  router.post('/invite-member', async (req, res) => {
+    try {
+      const { agency_id, target_numeric_id } = req.body;
+      const agent_uid = req.user.sub;
+      if (!agency_id || !target_numeric_id) {
+        return res.status(400).json({ error: 'agency_id and target_numeric_id required' });
+      }
+
+      // 1. Find target user
+      const { data: targetUser, error: userErr } = await supabase
+        .from('users')
+        .select('auth_uid, numeric_id, name')
+        .eq('numeric_id', target_numeric_id)
+        .maybeSingle();
+      if (userErr || !targetUser) {
+        return res.status(404).json({ error: 'المستخدم غير موجود بهذا الرقم' });
+      }
+
+      // 2. Check if already a member
+      const { data: existingMember } = await supabase
+        .from('host_agency_members')
+        .select('id')
+        .eq('agency_id', agency_id)
+        .eq('user_id', targetUser.auth_uid)
+        .eq('status', 'active')
+        .maybeSingle();
+      if (existingMember) {
+        return res.status(400).json({ error: 'العضو موجود بالفعل في الوكالة' });
+      }
+
+      // 3. Check if already has pending/invited request
+      const { data: existingRequest } = await supabase
+        .from('host_agency_join_requests')
+        .select('id')
+        .eq('agency_id', agency_id)
+        .eq('user_id', targetUser.auth_uid)
+        .in('status', ['pending', 'invited'])
+        .maybeSingle();
+      if (existingRequest) {
+        return res.status(400).json({ error: 'تم إرسال دعوة بالفعل لهذا المستخدم' });
+      }
+
+      // 4. Get agency name for notification
+      const { data: agency } = await supabase
+        .from('agencies')
+        .select('name')
+        .eq('id', agency_id)
+        .maybeSingle();
+
+      // 5. Get agent name
+      const { data: agentUser } = await supabase
+        .from('users')
+        .select('name')
+        .eq('auth_uid', agent_uid)
+        .maybeSingle();
+
+      // 6. Create join request with status 'invited'
+      const { error: insertErr } = await supabase
+        .from('host_agency_join_requests')
+        .insert({
+          agency_id,
+          user_id: targetUser.auth_uid,
+          status: 'invited',
+          message: `دعوة من الوكالة: ${agency?.name || agency_id}`,
+        });
+      if (insertErr) throw insertErr;
+
+      // 7. Send DM notification to the invited user
+      await supabase.from('dm_messages').insert({
+        from_user_id: agent_uid,
+        to_user_id: target_numeric_id,
+        from_name: agentUser?.name || 'الوكيل',
+        to_name: targetUser.name || target_numeric_id,
+        text: `📩 لديك دعوة للانضمام إلى الوكالة "${agency?.name || agency_id}"! افتح شاشة الوكالة لقبول أو رفض الدعوة.`,
+        is_read: false,
+      });
+
+      res.json({ ok: true, message: 'تم إرسال الدعوة بنجاح' });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  // ─── REMOVE MEMBER ───────────────────────────────
+
+  // DELETE /api/agency/remove-member — remove a member from agency
+  router.delete('/remove-member', async (req, res) => {
+    try {
+      const { agency_id, user_id } = req.body;
+      if (!agency_id || !user_id) {
+        return res.status(400).json({ error: 'agency_id and user_id required' });
+      }
+
+      // 1. Update member status to 'removed'
+      const { error: updateErr } = await supabase
+        .from('host_agency_members')
+        .update({ status: 'removed' })
+        .eq('agency_id', agency_id)
+        .eq('user_id', user_id);
+      if (updateErr) throw updateErr;
+
+      // 2. Send DM notification to removed user
+      const { data: removedUser } = await supabase
+        .from('users')
+        .select('numeric_id, name')
+        .eq('auth_uid', user_id)
+        .maybeSingle();
+
+      const { data: agency } = await supabase
+        .from('agencies')
+        .select('name')
+        .eq('id', agency_id)
+        .maybeSingle();
+
+      if (removedUser) {
+        await supabase.from('dm_messages').insert({
+          from_user_id: 'system',
+          to_user_id: removedUser.numeric_id,
+          from_name: 'النظام',
+          to_name: removedUser.name || removedUser.numeric_id,
+          text: `تم إزالتك من الوكالة "${agency?.name || agency_id}". يمكنك التواصل مع الإدارة لمعرفة التفاصيل.`,
+          is_read: false,
+        });
+      }
+
+      res.json({ ok: true, message: 'تم إزالة العضو بنجاح' });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
   return router;
 };
