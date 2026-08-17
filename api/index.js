@@ -228,6 +228,103 @@ app.get('/api/dm_messages', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ---------- ADMIN OPERATIONS (service-role required) ----------
+function adminAuth(req, res) {
+  const token = (req.headers.authorization || '').replace(/^Bearer\s+/i, '').trim();
+  if (!SUPABASE_SERVICE_ROLE_KEY || token !== SUPABASE_SERVICE_ROLE_KEY) {
+    res.status(403).json({ error: 'Forbidden: invalid admin key' });
+    return false;
+  }
+  return true;
+}
+
+app.post('/api/admin/delete-agency', async (req, res) => {
+  try {
+    if (!adminAuth(req, res)) return;
+    const { agency_id } = req.body;
+    if (!agency_id) return res.status(400).json({ error: 'agency_id required' });
+
+    const { data: agency } = await supabase.from('agencies').select('owner_id, name').eq('id', agency_id).single();
+    if (!agency) return res.status(404).json({ error: 'Agency not found' });
+
+    await supabase.from('agency_wallets').delete().eq('agency_id', agency_id);
+    await supabase.from('agency_topup_requests').delete().eq('agency_id', agency_id);
+    await supabase.from('agency_topup_logs').delete().eq('agency_id', agency_id);
+    await supabase.from('host_agency_members').delete().eq('agency_id', agency_id);
+    await supabase.from('host_agency_join_requests').delete().eq('agency_id', agency_id);
+
+    await supabase.from('agencies').delete().eq('id', agency_id);
+
+    if (agency.owner_id) {
+      try { await supabase.auth.admin.deleteUser(agency.owner_id); } catch {}
+    }
+
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/admin/topup-approve', async (req, res) => {
+  try {
+    if (!adminAuth(req, res)) return;
+    const { request_id } = req.body;
+    if (!request_id) return res.status(400).json({ error: 'request_id required' });
+
+    const { data: topupReq, error: rErr } = await supabase.from('agency_topup_requests').select('*').eq('id', request_id).single();
+    if (rErr || !topupReq) return res.status(404).json({ error: 'Request not found' });
+    if (topupReq.status !== 'pending') return res.status(400).json({ error: 'Already processed' });
+
+    const { data: existing } = await supabase.from('agency_wallets').select('*').eq('agency_id', topupReq.agency_id).maybeSingle();
+    if (!existing) {
+      await supabase.from('agency_wallets').insert({ agency_id: topupReq.agency_id, diamonds_balance: topupReq.diamonds, total_recharged: topupReq.diamonds, total_withdrawn: 0 });
+    } else {
+      await supabase.from('agency_wallets').update({
+        diamonds_balance: (existing.diamonds_balance ?? 0) + topupReq.diamonds,
+        total_recharged: (existing.total_recharged ?? 0) + topupReq.diamonds,
+      }).eq('agency_id', topupReq.agency_id);
+    }
+
+    await supabase.from('agency_topup_requests').update({ status: 'approved', reviewed_by: 'admin', reviewed_at: new Date().toISOString() }).eq('id', request_id);
+    await supabase.from('agency_topup_logs').insert({ request_id, agency_id: topupReq.agency_id, gateway_id: topupReq.gateway_id, amount_usd: topupReq.amount_usd, diamonds: topupReq.diamonds, approved_by: 'admin' });
+
+    const { data: finalWallet } = await supabase.from('agency_wallets').select('diamonds_balance').eq('agency_id', topupReq.agency_id).single();
+    res.json({ ok: true, diamonds_balance: finalWallet?.diamonds_balance ?? 0 });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/admin/topup-reject', async (req, res) => {
+  try {
+    if (!adminAuth(req, res)) return;
+    const { request_id, note } = req.body;
+    if (!request_id) return res.status(400).json({ error: 'request_id required' });
+
+    await supabase.from('agency_topup_requests').update({ status: 'rejected', admin_note: note || '', reviewed_by: 'admin', reviewed_at: new Date().toISOString() }).eq('id', request_id).eq('status', 'pending');
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/admin/topup-direct', async (req, res) => {
+  try {
+    if (!adminAuth(req, res)) return;
+    const { agency_id, diamonds } = req.body;
+    if (!agency_id || !diamonds || diamonds <= 0) return res.status(400).json({ error: 'agency_id and diamonds required' });
+
+    const { data: existing } = await supabase.from('agency_wallets').select('*').eq('agency_id', agency_id).maybeSingle();
+    if (!existing) {
+      await supabase.from('agency_wallets').insert({ agency_id, diamonds_balance: diamonds, total_recharged: diamonds, total_withdrawn: 0 });
+    } else {
+      await supabase.from('agency_wallets').update({
+        diamonds_balance: (existing.diamonds_balance ?? 0) + diamonds,
+        total_recharged: (existing.total_recharged ?? 0) + diamonds,
+      }).eq('agency_id', agency_id);
+    }
+
+    await supabase.from('agency_topup_logs').insert({ agency_id, amount_usd: 0, diamonds, approved_by: 'admin' });
+
+    const { data: finalWallet } = await supabase.from('agency_wallets').select('diamonds_balance').eq('agency_id', agency_id).single();
+    res.json({ ok: true, diamonds_balance: finalWallet?.diamonds_balance ?? 0 });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // ---------- DASHBOARD STATS ----------
 app.get('/api/dashboard/stats', async (req, res) => {
   try {

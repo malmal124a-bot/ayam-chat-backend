@@ -95,6 +95,7 @@ module.exports = function createAgencyRoutes(supabase, authMiddleware) {
         return res.status(400).json({ error: 'cost_diamonds required' });
       }
 
+      // Try RPC first
       const { data, error } = await supabase.rpc('rpc_agency_recharge', {
         p_agency_id: agency_id,
         p_agent_uid: agent_uid,
@@ -104,9 +105,43 @@ module.exports = function createAgencyRoutes(supabase, authMiddleware) {
         p_cost_diamonds: cost_diamonds,
       });
 
-      if (error) throw error;
-      if (!data.ok) return res.status(400).json(data);
-      res.json(data);
+      if (!error && data?.ok) return res.json(data);
+
+      // Fallback: direct operations
+      const { data: wallet } = await supabase.from('agency_wallets')
+        .select('diamonds_balance').eq('agency_id', agency_id).maybeSingle();
+      if (!wallet || (wallet.diamonds_balance ?? 0) < cost_diamonds) {
+        return res.status(400).json({ ok: false, error: 'رصيد الوكالة غير كافٍ' });
+      }
+
+      const { error: deductErr } = await supabase.from('agency_wallets').update({
+        diamonds_balance: wallet.diamonds_balance - cost_diamonds,
+        updated_at: new Date().toISOString(),
+      }).eq('agency_id', agency_id);
+      if (deductErr) throw deductErr;
+
+      const { data: targetUser } = await supabase.from('users')
+        .select('auth_uid, diamonds').eq('auth_uid', target_user_id).maybeSingle();
+      if (!targetUser) {
+        await supabase.from('agency_wallets').update({
+          diamonds_balance: wallet.diamonds_balance,
+        }).eq('agency_id', agency_id);
+        return res.status(400).json({ ok: false, error: 'المستخدم غير موجود' });
+      }
+
+      const { error: addErr } = await supabase.from('users').update({
+        diamonds: (targetUser.diamonds ?? 0) + diamonds,
+      }).eq('auth_uid', target_user_id);
+      if (addErr) throw addErr;
+
+      await supabase.from('agency_recharges').insert({
+        agency_id, agent_user_id: agent_uid, target_user_id,
+        target_numeric_id: target_numeric_id || null,
+        diamonds, cost_diamonds, status: 'completed',
+      });
+
+      const remaining = wallet.diamonds_balance - cost_diamonds;
+      res.json({ ok: true, diamonds_charged: diamonds, cost_diamonds, remaining_balance: remaining });
     } catch (e) { res.status(500).json({ error: e.message }); }
   });
 
@@ -121,6 +156,7 @@ module.exports = function createAgencyRoutes(supabase, authMiddleware) {
         return res.status(400).json({ error: 'Missing required fields' });
       }
 
+      // Try RPC first
       const { data, error } = await supabase.rpc('rpc_agency_withdraw', {
         p_agency_id: agency_id,
         p_agent_uid: agent_uid,
@@ -129,9 +165,37 @@ module.exports = function createAgencyRoutes(supabase, authMiddleware) {
         p_diamonds: diamonds,
       });
 
-      if (error) throw error;
-      if (!data.ok) return res.status(400).json(data);
-      res.json(data);
+      if (!error && data?.ok) return res.json(data);
+
+      // Fallback: direct operations
+      const { data: sourceUser } = await supabase.from('users')
+        .select('auth_uid, diamonds').eq('auth_uid', source_user_id).maybeSingle();
+      if (!sourceUser) return res.status(400).json({ ok: false, error: 'المستخدم غير موجود' });
+      if ((sourceUser.diamonds ?? 0) < diamonds) return res.status(400).json({ ok: false, error: 'رصيد المستخدم غير كافٍ' });
+
+      // Deduct from user
+      await supabase.from('users').update({ diamonds: sourceUser.diamonds - diamonds }).eq('auth_uid', source_user_id);
+
+      // Add to agency wallet
+      const { data: wallet } = await supabase.from('agency_wallets')
+        .select('diamonds_balance').eq('agency_id', agency_id).maybeSingle();
+      if (!wallet) {
+        await supabase.from('agency_wallets').insert({ agency_id, diamonds_balance: diamonds, total_withdrawn: diamonds });
+      } else {
+        await supabase.from('agency_wallets').update({
+          diamonds_balance: (wallet.diamonds_balance ?? 0) + diamonds,
+          total_withdrawn: (wallet.total_withdrawn ?? 0) + diamonds,
+        }).eq('agency_id', agency_id);
+      }
+
+      // Log
+      await supabase.from('agency_withdrawals').insert({
+        agency_id, agent_user_id: agent_uid, source_user_id,
+        source_numeric_id: source_numeric_id || null, diamonds, status: 'completed',
+      });
+
+      const newBalance = (wallet?.diamonds_balance ?? 0) + diamonds;
+      res.json({ ok: true, new_balance: newBalance, diamonds_withdrawn: diamonds });
     } catch (e) { res.status(500).json({ error: e.message }); }
   });
 
@@ -316,21 +380,33 @@ module.exports = function createAgencyRoutes(supabase, authMiddleware) {
       const { agency_id } = req.query;
       if (!agency_id) return res.status(400).json({ error: 'agency_id required' });
 
-      const { data, error } = await supabase
+      const { data: members, error } = await supabase
         .from('host_agency_members')
-        .select('*, users:users!host_agency_members_user_id_fkey(auth_uid, numeric_id, name, photo_url, diamonds)')
+        .select('*')
         .eq('agency_id', agency_id);
 
-      if (error) {
-        // Fallback: just get members without the join
-        const { data: members, error: e2 } = await supabase
-          .from('host_agency_members')
-          .select('*')
-          .eq('agency_id', agency_id);
-        if (e2) throw e2;
-        return res.json(members);
+      if (error) throw error;
+      if (!members || members.length === 0) return res.json([]);
+
+      const userIds = [...new Set(members.map(m => m.user_id).filter(Boolean))];
+      let usersMap = {};
+      if (userIds.length > 0) {
+        const { data: users } = await supabase
+          .from('users')
+          .select('auth_uid, numeric_id, name, photo_url, diamonds')
+          .in('auth_uid', userIds);
+        if (users) users.forEach(u => { usersMap[u.auth_uid] = u; });
       }
-      res.json(data);
+
+      const enriched = members.map(m => ({
+        ...m,
+        users: usersMap[m.user_id] || null,
+        name: usersMap[m.user_id]?.name,
+        numeric_id: usersMap[m.user_id]?.numeric_id,
+        photo_url: usersMap[m.user_id]?.photo_url,
+        diamonds: usersMap[m.user_id]?.diamonds,
+      }));
+      res.json(enriched);
     } catch (e) { res.status(500).json({ error: e.message }); }
   });
 
@@ -516,12 +592,49 @@ module.exports = function createAgencyRoutes(supabase, authMiddleware) {
     try {
       const { request_id } = req.body;
       if (!request_id) return res.status(400).json({ error: 'request_id required' });
-      const { data, error } = await supabase.rpc('rpc_approve_topup', {
+
+      // Try RPC first
+      const { data: rpcResult, error: rpcError } = await supabase.rpc('rpc_approve_topup', {
         p_request_id: request_id,
         p_admin_id: req.user.sub,
       });
-      if (error) throw error;
-      res.json(data);
+      if (!rpcError && rpcResult?.ok) return res.json(rpcResult);
+
+      // Fallback: direct operations
+      const { data: reqData, error: reqErr } = await supabase
+        .from('agency_topup_requests').select('*').eq('id', request_id).single();
+      if (reqErr || !reqData) return res.status(400).json({ error: 'طلب غير موجود' });
+      if (reqData.status !== 'pending') return res.status(400).json({ error: 'تم معالجة هذا الطلب مسبقاً' });
+
+      // Ensure wallet exists (don't reset balance)
+      const { data: existing } = await supabase.from('agency_wallets')
+        .select('*').eq('agency_id', reqData.agency_id).maybeSingle();
+
+      let newBalance;
+      if (!existing) {
+        newBalance = reqData.diamonds;
+        await supabase.from('agency_wallets').insert({
+          agency_id: reqData.agency_id, diamonds_balance: newBalance,
+          total_recharged: newBalance, total_withdrawn: 0,
+        });
+      } else {
+        newBalance = (existing.diamonds_balance ?? 0) + reqData.diamonds;
+        await supabase.from('agency_wallets').update({
+          diamonds_balance: newBalance,
+          total_recharged: (existing.total_recharged ?? 0) + reqData.diamonds,
+        }).eq('agency_id', reqData.agency_id);
+      }
+
+      await supabase.from('agency_topup_requests').update({
+        status: 'approved', reviewed_by: req.user.sub, reviewed_at: new Date().toISOString(),
+      }).eq('id', request_id);
+
+      await supabase.from('agency_topup_logs').insert({
+        request_id, agency_id: reqData.agency_id, gateway_id: reqData.gateway_id,
+        amount_usd: reqData.amount_usd, diamonds: reqData.diamonds, approved_by: req.user.sub,
+      });
+
+      res.json({ ok: true, new_balance: newBalance, diamonds_added: reqData.diamonds });
     } catch (e) { res.status(500).json({ error: e.message }); }
   });
 
@@ -530,13 +643,17 @@ module.exports = function createAgencyRoutes(supabase, authMiddleware) {
     try {
       const { request_id, reason } = req.body;
       if (!request_id) return res.status(400).json({ error: 'request_id required' });
-      const { data, error } = await supabase.rpc('rpc_reject_topup', {
-        p_request_id: request_id,
-        p_admin_id: req.user.sub,
-        p_reason: reason || '',
-      });
+
+      const { data, error } = await supabase
+        .from('agency_topup_requests')
+        .update({ status: 'rejected', admin_note: reason || '', reviewed_by: req.user.sub, reviewed_at: new Date().toISOString() })
+        .eq('id', request_id)
+        .eq('status', 'pending')
+        .select('*')
+        .single();
       if (error) throw error;
-      res.json(data);
+      if (!data) return res.status(400).json({ error: 'طلب غير موجود أو تم معالجته' });
+      res.json({ ok: true });
     } catch (e) { res.status(500).json({ error: e.message }); }
   });
 
@@ -547,13 +664,30 @@ module.exports = function createAgencyRoutes(supabase, authMiddleware) {
       if (!agency_id || !diamonds || diamonds <= 0) {
         return res.status(400).json({ error: 'agency_id and diamonds > 0 required' });
       }
-      const { data, error } = await supabase.rpc('rpc_admin_topup_agency', {
-        p_agency_id: agency_id,
-        p_diamonds: diamonds,
-        p_admin_id: req.user.sub,
+
+      // Ensure wallet exists (don't reset balance)
+      const { data: existing } = await supabase.from('agency_wallets')
+        .select('*').eq('agency_id', agency_id).maybeSingle();
+
+      let newBalance;
+      if (!existing) {
+        newBalance = diamonds;
+        await supabase.from('agency_wallets').insert({
+          agency_id, diamonds_balance: newBalance, total_recharged: newBalance, total_withdrawn: 0,
+        });
+      } else {
+        newBalance = (existing.diamonds_balance ?? 0) + diamonds;
+        await supabase.from('agency_wallets').update({
+          diamonds_balance: newBalance,
+          total_recharged: (existing.total_recharged ?? 0) + diamonds,
+        }).eq('agency_id', agency_id);
+      }
+
+      await supabase.from('agency_topup_logs').insert({
+        agency_id, amount_usd: 0, diamonds, approved_by: req.user.sub,
       });
-      if (error) throw error;
-      res.json(data);
+
+      res.json({ ok: true, new_balance: newBalance, diamonds_added: diamonds });
     } catch (e) { res.status(500).json({ error: e.message }); }
   });
 
